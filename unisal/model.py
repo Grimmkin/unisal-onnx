@@ -84,7 +84,7 @@ class DomainBatchNorm2d(nn.Module):
     During the forward pass, select the BN module based on self.this_source.
     """
 
-    def __init__(self, num_features, sources, momenta=None, **kwargs):
+    def __init__(self, num_features, sources, momenta=None, export_source=None, **kwargs):
         """
         num_features: Number of channels
         sources: List of sources
@@ -111,9 +111,14 @@ class DomainBatchNorm2d(nn.Module):
         # Prepare the self.this_source attribute that will be updated at runtime
         # by the model
         self.this_source = None
+        self.export_source = export_source
 
     def forward(self, x):
-        return self.__getattr__(f"bn_{self.this_source}")(x)
+        if self.export_source is not None:
+            bn_module = self.__getattr__(f"bn_{self.export_source}")
+        else:
+            bn_module = self.__getattr__(f"bn_{self.this_source}")
+        return bn_module(x)
 
 
 class UNISAL(BaseModel, utils.KwConfigClass):
@@ -166,8 +171,18 @@ class UNISAL(BaseModel, utils.KwConfigClass):
         ds_smoothing=True,
         ds_gaussians=True,
         verbose=1,
+        export_mode=False,
+        export_source=None,
     ):
         super().__init__()
+
+        self.export_mode = export_mode
+        self.export_source = export_source
+        if self.export_mode and self.export_source:
+            self.export_source_str = f"_{self.export_source.lower()}"
+        else:
+            self.export_source_str = None # Or some other default
+
 
         # Check inputs
         assert gaussian_init in ("random", "manual")
@@ -342,6 +357,25 @@ class UNISAL(BaseModel, utils.KwConfigClass):
 
     def get_bn_module(self, num_features, **kwargs):
         """Return BatchNorm class (domain-specific or domain-invariant)."""
+        if self.export_mode and self.export_source:
+            # Determine the momentum for the export source
+            try:
+                source_idx = self.sources.index(self.export_source)
+                momentum = self.bn_momentum if self.export_source != "SALICON" else self.static_bn_momentum
+            except ValueError:
+                # Fallback or error if export_source is not in self.sources
+                # This case should ideally be handled based on project's requirements
+                # For now, let's use default bn_momentum if source not found for some reason
+                momentum = self.bn_momentum
+
+            return DomainBatchNorm2d(
+                num_features,
+                sources=[self.export_source],
+                momenta=[momentum],
+                export_source=self.export_source,
+                **kwargs
+            )
+
         momenta = [
             self.bn_momentum if src != "SALICON" else self.static_bn_momentum
             for src in self.sources
@@ -504,9 +538,13 @@ class UNISAL(BaseModel, utils.KwConfigClass):
         self.this_source = source
 
         # Prepare other parameters
-        source_str = f"_{source.lower()}"
-        if static is None:
-            static = x.shape[1] == 1 or self.sources == ("SALICON",)
+        if self.export_mode:
+            source_str = self.export_source_str
+            static = True # Override static for export mode
+        else:
+            source_str = f"_{source.lower()}"
+            if static is None:
+                static = x.shape[1] == 1 or self.sources == ("SALICON",)
 
         # Compute backbone CNN features and concatenate with Gaussian prior maps
         feat_seq_1x = []
@@ -519,7 +557,18 @@ class UNISAL(BaseModel, utils.KwConfigClass):
             im_feat_4x = self.skip_4x(im_feat_4x)
 
             if self.n_gaussians > 0:
-                gaussian_maps = self._get_gaussian_maps(im_feat_1x, source_str)
+                if self.export_mode and self.export_source:
+                    gaussians_attr_name = "coarse_gaussians" + (self.export_source_str if self.ds_gaussians else "")
+                    # Ensure the attribute exists before trying to access it
+                    if hasattr(self, gaussians_attr_name):
+                        gaussians = self.__getattr__(gaussians_attr_name)
+                        gaussian_maps = self._make_gaussian_maps(im_feat_1x, gaussians)
+                    else:
+                        # Fallback if ds_gaussians was false for export_source during init
+                        # Or handle as an error, for now, creating empty maps or skipping
+                        gaussian_maps = torch.empty(im_feat_1x.shape[0], 0, im_feat_1x.shape[2], im_feat_1x.shape[3], device=im_feat_1x.device)
+                else:
+                    gaussian_maps = self._get_gaussian_maps(im_feat_1x, source_str)
                 im_feat_1x = torch.cat((im_feat_1x, gaussian_maps), dim=1)
 
             im_feat_1x = self.post_cnn(im_feat_1x)
@@ -528,6 +577,8 @@ class UNISAL(BaseModel, utils.KwConfigClass):
             feat_seq_4x.append(im_feat_4x)
 
         feat_seq_1x = torch.stack(feat_seq_1x, dim=1)
+        feat_seq_2x = torch.stack(feat_seq_2x, dim=1)
+        feat_seq_4x = torch.stack(feat_seq_4x, dim=1)
 
         # Bypass-RNN
         hidden, rnn_feat_seq, rnn_feat = (None,) * 3
@@ -547,21 +598,29 @@ class UNISAL(BaseModel, utils.KwConfigClass):
                     im_feat = rnn_feat
 
             im_feat = self.upsampling_1(im_feat)
-            im_feat = torch.cat((im_feat, feat_seq_2x[idx]), dim=1)
+            im_feat = torch.cat((im_feat, feat_seq_2x[:, idx, ...]), dim=1)
             im_feat = self.upsampling_2(im_feat)
-            im_feat = torch.cat((im_feat, feat_seq_4x[idx]), dim=1)
+            im_feat = torch.cat((im_feat, feat_seq_4x[:, idx, ...]), dim=1)
             im_feat = self.post_upsampling_2(im_feat)
 
-            im_feat = self.__getattr__(
-                "adaptation" + (source_str if self.ds_adaptation else "")
-            )(im_feat)
+            if self.export_mode and self.export_source:
+                adaptation_attr_name = "adaptation" + (self.export_source_str if self.ds_adaptation else "")
+                im_feat = self.__getattr__(adaptation_attr_name)(im_feat)
+            else:
+                im_feat = self.__getattr__(
+                    "adaptation" + (source_str if self.ds_adaptation else "")
+                )(im_feat)
 
             im_feat = F.interpolate(im_feat, size=x.shape[-2:], mode="nearest")
 
             im_feat = F.pad(im_feat, [self.smoothing_ksize // 2] * 4, mode="replicate")
-            im_feat = self.__getattr__(
-                "smoothing" + (source_str if self.ds_smoothing else "")
-            )(im_feat)
+            if self.export_mode and self.export_source:
+                smoothing_attr_name = "smoothing" + (self.export_source_str if self.ds_smoothing else "")
+                im_feat = self.__getattr__(smoothing_attr_name)(im_feat)
+            else:
+                im_feat = self.__getattr__(
+                    "smoothing" + (source_str if self.ds_smoothing else "")
+                )(im_feat)
 
             im_feat = F.interpolate(
                 im_feat, size=target_size, mode="bilinear", align_corners=False
